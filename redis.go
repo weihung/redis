@@ -1,17 +1,18 @@
 package redis
 
 import (
+	"context"
 	"os"
-	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
-	r "github.com/gomodule/redigo/redis"
+	r "github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 )
 
 var (
-	redisPool *r.Pool // Redis pool
-	works     = runtime.NumCPU()
+	rdb *r.ClusterClient // Redis
 )
 
 /*
@@ -19,116 +20,40 @@ var (
 */
 func InitRedis(logger *zap.SugaredLogger) {
 	logger.Info("init redis")
-	var host = "localhost"
-	if v := os.Getenv("REDIS_HOST"); len(v) > 0 {
-		host = v
+	var hosts = ":6379"
+	if v := os.Getenv("REDIS_SERVER"); len(v) > 0 {
+		hosts = v
 	} else {
-		logger.Error("REDIS_HOST envirment not found")
+		logger.Error("REDIS_SERVER envirment not found")
 	}
-	var port = "6379"
-	if v := os.Getenv("REDIS_PORT"); len(v) > 0 {
-		port = v
+	var password = ""
+	if v := os.Getenv("REDIS_PASSWORD"); len(v) > 0 {
+		password = v
 	} else {
-		logger.Error("REDIS_PORT envirment not found")
+		logger.Error("REDIS_PASSWORD envirment not found")
 	}
 
-	redisServer := host + ":" + port
-	logger.Infof("redis url is %s", redisServer)
-	redisPassword := os.Getenv("REDIS_PASSWORD")
-	redisPool = &r.Pool{
-		MaxIdle:     works,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (r.Conn, error) {
-			c, err := r.Dial("tcp", redisServer)
-			if err != nil {
-				logger.Fatalw("connect to redis error", "err", err)
-				return nil, err
-			}
-			if redisPassword == "" {
-				logger.Error("redis password is empty")
-				return c, nil
-			}
-			_, err = c.Do("AUTH", redisPassword)
-			if err != nil {
-				c.Close()
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c r.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			if err != nil {
-				logger.Errorw("ping redis server error", "err", err)
-			}
-			return err
-		},
-	}
+	rdb = r.NewClusterClient(&r.ClusterOptions{
+		Addrs:    strings.Split(hosts, ","),
+		Password: password,
+	})
 }
 
-func GetPool() *r.Pool {
-	return redisPool
+func GetRedis() *r.ClusterClient {
+	return rdb
 }
 
 /*
- 	Set redis string value
+ 	Set redis value
 		Paramters
 			key: redis key
 */
-func SetStringValue(key string, value string, expire int) error {
-	conn := redisPool.Get()
-	defer conn.Close()
-	if expire < 0 {
-		_, err := conn.Do("SET", key, value)
-		return err
-	}
-	_, err := conn.Do("SETEX", key, expire, value)
-	return err
-}
-
-/*
-	Set redis bytes value
-		Paramters
-			key: redis key
-*/
-func SetBytesValue(key string, value []byte, expire int) error {
-	conn := redisPool.Get()
-	defer conn.Close()
-	if expire < 0 {
-		_, err := conn.Do("SET", key, value)
-		return err
-	}
-	_, err := conn.Do("SETEX", key, expire, value)
-	return err
-}
-
-/*
-	Set redis interface value
-		Paramters
-			key: redis key
-*/
-func SetInterfaceValue(key string, value interface{}, expire int) error {
-	conn := redisPool.Get()
-	defer conn.Close()
-	if expire < 0 {
-		_, err := conn.Do("SET", key, value)
-		return err
-	}
-	_, err := conn.Do("SETEX", key, expire, value)
-	return err
-}
-
-/*
- 	Set redis integer value
-		Paramters
-			key: redis key
-*/
-func SetIntValue(key string, value int64, expire int) error {
-	conn := redisPool.Get()
-	defer conn.Close()
+func SetValue(key string, value interface{}, expire int) error {
+	ctx := context.Background()
 	if expire <= 0 {
-		_, err := conn.Do("SET", key, value)
-		return err
+		expire = 0
 	}
-	_, err := conn.Do("SETEX", key, expire, value)
+	_, err := rdb.Set(ctx, key, value, time.Second*time.Duration(expire)).Result()
 	return err
 }
 
@@ -138,10 +63,9 @@ func SetIntValue(key string, value int64, expire int) error {
 			key: redis key
 */
 func GetBytes(key string) ([]byte, error) {
-	conn := redisPool.Get()
-	defer conn.Close()
-	data, err := r.Bytes(conn.Do("GET", key))
-	return data, err
+	ctx := context.Background()
+	data, err := rdb.Get(ctx, key).Result()
+	return []byte(data), err
 }
 
 /*
@@ -150,10 +74,8 @@ func GetBytes(key string) ([]byte, error) {
 			key: redis key
 */
 func GetString(key string) (string, error) {
-	conn := redisPool.Get()
-	defer conn.Close()
-	data, err := r.String(conn.Do("GET", key))
-	return data, err
+	ctx := context.Background()
+	return rdb.Get(ctx, key).Result()
 }
 
 /*
@@ -162,9 +84,12 @@ func GetString(key string) (string, error) {
 			key: redis key
 */
 func GetInt(key string) (int64, error) {
-	conn := redisPool.Get()
-	defer conn.Close()
-	return r.Int64(conn.Do("GET", key))
+	ctx := context.Background()
+	data, err := rdb.Get(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(data, 10, 64)
 }
 
 /*
@@ -172,10 +97,9 @@ func GetInt(key string) (int64, error) {
 		Paramters
 			key: redis key
 */
-func GetTTL(key string) (int, error) {
-	conn := redisPool.Get()
-	defer conn.Close()
-	return r.Int(conn.Do("TTL", key))
+func GetTTL(key string) (time.Duration, error) {
+	ctx := context.Background()
+	return rdb.TTL(ctx, key).Result()
 }
 
 /*
@@ -184,9 +108,8 @@ func GetTTL(key string) (int, error) {
 			key: redis key
 */
 func DelKey(key string) error {
-	conn := redisPool.Get()
-	defer conn.Close()
-	_, err := conn.Do("DEL", key)
+	ctx := context.Background()
+	_, err := rdb.Del(ctx, key).Result()
 	return err
 }
 
@@ -197,20 +120,19 @@ func DelKey(key string) error {
 			data: array data
 */
 func SetArrayStringData(key string, data []string, expire int) error {
-	conn := redisPool.Get()
-	defer conn.Close()
-	_, err := conn.Do("DEL", key)
+	ctx := context.Background()
+	_, err := rdb.Del(ctx, key).Result()
 	if err != nil {
 		return err
 	}
 	for _, d := range data {
-		_, err := conn.Do("LPUSH", key, d)
+		_, err := rdb.LPush(ctx, key, d).Result()
 		if err != nil {
 			return err
 		}
 	}
 	if expire >= 0 {
-		_, err = conn.Do("EXPIRE", key, expire)
+		_, err = rdb.Expire(ctx, key, time.Second*time.Duration(expire)).Result()
 	}
 	return err
 }
@@ -219,7 +141,6 @@ func SetArrayStringData(key string, data []string, expire int) error {
 	Get redis array string data
 */
 func GetArrayStringData(key string) ([]string, error) {
-	conn := redisPool.Get()
-	defer conn.Close()
-	return r.Strings(conn.Do("LRANGE", key, 0, -1))
+	ctx := context.Background()
+	return rdb.LRange(ctx, key, 0, -1).Result()
 }
